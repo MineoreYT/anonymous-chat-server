@@ -39,6 +39,9 @@ io.on('connection', (socket) => {
     return;
   }
 
+
+
+
   // Add socket to onlineUsers
   if (!onlineUsers[userID]) onlineUsers[userID] = [];
   onlineUsers[userID].push(socket.id);
@@ -112,3 +115,4 @@ app.get('/', (req, res) => res.send('Server running with Socket.IO'));
 
 const PORT = process.env.PORT || 4000;
 server.listen(PORT, () => console.log(`Server listening on ${PORT}`));
+
