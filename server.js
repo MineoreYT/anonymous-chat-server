@@ -1,3 +1,4 @@
+// server.js
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
@@ -7,22 +8,29 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+// Create HTTP server
 const server = http.createServer(app);
-const io = new Server(server, { cors: { origin: '*' } });
 
-// Online users (multiple sockets per userID)
-let onlineUsers = {}; // userID -> [socketIDs]
+// Socket.IO server
+const io = new Server(server, {
+  cors: { origin: '*' },
+  path: '/socket.io', // explicitly define path
+});
 
-// Rooms (roomID -> array of socketIDs)
-let rooms = {}; 
+// Online users map: userID -> [socketIDs]
+let onlineUsers = {};
 
-// --- Create private room endpoint ---
+// Rooms: roomID -> [socketIDs]
+let rooms = {};
+
+// --- REST endpoint to create rooms ---
 app.get('/create-room', (req, res) => {
   const roomID = 'room-' + Math.random().toString(36).substring(2, 10);
   rooms[roomID] = [];
   res.json({ roomID });
 });
 
+// --- Socket.IO connection ---
 io.on('connection', (socket) => {
   const userID = socket.handshake.auth?.userID;
   if (!userID) {
@@ -35,26 +43,26 @@ io.on('connection', (socket) => {
   if (!onlineUsers[userID]) onlineUsers[userID] = [];
   onlineUsers[userID].push(socket.id);
 
-  console.log('Connected:', userID, '->', socket.id);
+  console.log(`User connected: ${userID} -> ${socket.id}`);
   io.emit('online_users', Object.keys(onlineUsers));
 
   // --- Private messaging ---
   socket.on('private_message', ({ to, from, text, time }) => {
-    const targetSockets = onlineUsers[to] || [];
-    targetSockets.forEach(sid => io.to(sid).emit('receive_private', { from, text, time }));
+    const targets = onlineUsers[to] || [];
+    targets.forEach(sid => io.to(sid).emit('receive_private', { from, text, time }));
   });
 
   // --- WebRTC calls ---
   socket.on('call-user', ({ to, offer }) => {
-    const targetSockets = onlineUsers[to] || [];
-    if (!targetSockets.length) {
+    const targets = onlineUsers[to] || [];
+    if (!targets.length) {
       socket.emit('call-error', { message: 'User not available' });
       return;
     }
-    io.to(targetSockets[0]).emit('incoming-call', {
+    io.to(targets[0]).emit('incoming-call', {
       from: userID,
       fromSocketId: socket.id,
-      offer
+      offer,
     });
   });
 
@@ -63,8 +71,7 @@ io.on('connection', (socket) => {
   });
 
   socket.on('ice-candidate', ({ toSocketId, candidate }) => {
-    if (!toSocketId || !candidate) return;
-    io.to(toSocketId).emit('ice-candidate', { fromSocketId: socket.id, candidate });
+    if (toSocketId && candidate) io.to(toSocketId).emit('ice-candidate', { fromSocketId: socket.id, candidate });
   });
 
   socket.on('end-call', ({ toSocketId }) => {
@@ -85,16 +92,14 @@ io.on('connection', (socket) => {
 
   // --- Disconnect ---
   socket.on('disconnect', () => {
-    console.log('Disconnected:', userID, socket.id);
+    console.log(`Disconnected: ${userID} -> ${socket.id}`);
 
-    // Remove from onlineUsers
     if (onlineUsers[userID]) {
       onlineUsers[userID] = onlineUsers[userID].filter(sid => sid !== socket.id);
       if (!onlineUsers[userID].length) delete onlineUsers[userID];
     }
     io.emit('online_users', Object.keys(onlineUsers));
 
-    // Remove from rooms
     for (const roomID in rooms) {
       rooms[roomID] = rooms[roomID].filter(sid => sid !== socket.id);
       if (!rooms[roomID].length) delete rooms[roomID];
@@ -102,6 +107,8 @@ io.on('connection', (socket) => {
   });
 });
 
-app.get('/', (req, res) => res.send('Server running'));
+// --- Simple health check ---
+app.get('/', (req, res) => res.send('Server running with Socket.IO'));
+
 const PORT = process.env.PORT || 4000;
 server.listen(PORT, () => console.log(`Server listening on ${PORT}`));
