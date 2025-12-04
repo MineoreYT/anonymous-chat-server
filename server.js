@@ -58,7 +58,7 @@ function saveBanList() {
 const onlineUsers = {}; // { userID: Set(socket.id) }
 
 // Anti-abuse
-const MAX_CONNECTIONS_PER_IP = 1;
+const MAX_CONNECTIONS_PER_IP = 2;
 const ipConnections = {}; // { ip: count }
 const RATE_LIMIT_WINDOW_MS = 5000; // 5s
 const RATE_LIMIT_MAX_MESSAGES = 5; // per socket
@@ -214,4 +214,5 @@ app.get("/", (_, res) => res.send("Server OK"));
 
 const PORT = process.env.PORT || 4000;
 server.listen(PORT, () => console.log("Server running on " + PORT));
+
 
