@@ -1,4 +1,3 @@
-// server.js -- Secure Chat Server
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
@@ -10,233 +9,208 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// config
-const PORT = process.env.PORT || 4000;
-const IS_RENDER = !!process.env.RENDER;
-const LIVE_CHAT_FILE = IS_RENDER ? path.join("/tmp", "live_messages.json") : path.join(__dirname, "live_messages.json");
-const MAX_STORED_MESSAGES = 200;
-const MAX_MESSAGE_LENGTH = 300; // characters
-const MAX_IMAGE_SIZE_BASE64 = 150000; // approx characters limit for inline base64 (discouraged)
-const MAX_CONNECTIONS_PER_IP = 6;
-const RATE_LIMIT_WINDOW_MS = 3000; // window for rate limiting
-const RATE_LIMIT_MAX_MESSAGES = 8; // allowed messages per window
+const server = http.createServer(app);
+const io = new Server(server, {
+  cors: { origin: '*' },
+  path: '/socket.io',
+});
 
-// helpers
-function generateUserID() {
-  const adjectives = ["Swift","Silent","Brave","Lucky","Clever","Mighty","Happy","Cosmic","Frosty","Shadow"];
-  const animals = ["Tiger","Falcon","Wolf","Panda","Eagle","Lion","Otter","Hawk","Bear","Dragon"];
-  const adj = adjectives[Math.floor(Math.random()*adjectives.length)];
-  const animal = animals[Math.floor(Math.random()*animals.length)];
-  return `${adj}${animal}-${Math.floor(1000 + Math.random()*9000)}`;
+// File paths
+const LIVE_CHAT_FILE = process.env.RENDER
+  ? path.join("/tmp", "live_messages.json")
+  : path.join(__dirname, "live_messages.json");
+
+const BAN_LIST_FILE = process.env.RENDER
+  ? path.join("/tmp", "banned_ips.json")
+  : path.join(__dirname, "banned_ips.json");
+
+// Load live messages
+let liveChatMessages = [];
+try {
+  if (fs.existsSync(LIVE_CHAT_FILE)) {
+    liveChatMessages = JSON.parse(fs.readFileSync(LIVE_CHAT_FILE, "utf8"));
+  } else {
+    fs.writeFileSync(LIVE_CHAT_FILE, "[]");
+  }
+} catch (err) { console.error("Error loading messages:", err); }
+
+// Load banned IPs
+let ipBans = {};
+try {
+  if (fs.existsSync(BAN_LIST_FILE)) {
+    ipBans = JSON.parse(fs.readFileSync(BAN_LIST_FILE, "utf8"));
+  } else {
+    fs.writeFileSync(BAN_LIST_FILE, "{}");
+  }
+} catch (err) { console.error("Error loading ban list:", err); }
+
+function saveMessages() {
+  try { fs.writeFileSync(LIVE_CHAT_FILE, JSON.stringify(liveChatMessages, null, 2)); }
+  catch (err) { console.error("Error saving messages:", err); }
+}
+
+function saveBanList() {
+  try { fs.writeFileSync(BAN_LIST_FILE, JSON.stringify(ipBans, null, 2)); }
+  catch (err) { console.error("Error saving ban list:", err); }
+}
+
+// Online users
+const onlineUsers = {}; // { userID: Set(socket.id) }
+
+// Anti-abuse
+const MAX_CONNECTIONS_PER_IP = 2;
+const ipConnections = {}; // { ip: count }
+const RATE_LIMIT_WINDOW_MS = 5000; // 5s
+const RATE_LIMIT_MAX_MESSAGES = 5; // per socket
+const rateLimitState = {}; // { socket.id: { count, windowStart } }
+const MAX_MESSAGE_LENGTH = 300;
+const MAX_IMAGE_SIZE_BASE64 = 150000;
+const ipSpamCount = {}; // { ip: count }
+let lastMessageText = {}; // { socket.id: lastText }
+
+function getClientIP(socket) {
+  const forwarded = socket.handshake.headers['x-forwarded-for'];
+  if (forwarded) return forwarded.split(',')[0].trim();
+  return socket.handshake.address;
 }
 
 function sanitizeText(s) {
-  if (typeof s !== 'string') return '';
-  // lightweight sanitization: remove angle-brackets and trim
-  return s.replace(/[<>]/g, '').trim();
+  return String(s || '').replace(/[<>]/g, '').trim();
 }
 
 function isBase64Image(text) {
   return typeof text === 'string' && text.startsWith('data:image/');
 }
 
-// persistent storage load/save
-let liveChatMessages = [];
-try {
-  if (fs.existsSync(LIVE_CHAT_FILE)) {
-    const raw = fs.readFileSync(LIVE_CHAT_FILE, 'utf8');
-    liveChatMessages = JSON.parse(raw || "[]");
-  } else {
-    fs.writeFileSync(LIVE_CHAT_FILE, "[]");
-  }
-} catch (err) {
-  console.error('Failed to load live messages:', err);
-  liveChatMessages = [];
-}
+// REST route for chat history
+app.get('/live-messages', (_, res) => res.json(liveChatMessages));
 
-function saveMessages() {
-  try {
-    fs.writeFileSync(LIVE_CHAT_FILE, JSON.stringify(liveChatMessages.slice(-MAX_STORED_MESSAGES), null, 2));
-  } catch (err) {
-    console.error('Failed to save live messages:', err);
-  }
-}
+// Troll messages
+const trollMessages = [
+  "🚨 Got IP BANNED DUMMASS 😎",
+  "🛑 SORRY FOR NOT GIVING A FUCK ON YOUR RETIRED IP. 🏖️",
+  "🔥 Boom! Retarded detected. You've unlocked the permanent ban achievement! 🏆",
+  "🎉 Congratulations Dumbass You've spammed your way into a permanent ban. ! 👋",
+];
 
-/* In-memory runtime state */
-const onlineUsers = {}; // { userID: [socketId, ...] }
-const socketToUser = {}; // { socket.id: userID }
-const ipConnections = {}; // { ip: count }
-const rateLimitState = {}; // { socket.id: { count, windowStart } }
-
-// express route for history
-app.get('/live-messages', (req, res) => {
-  res.json(liveChatMessages.slice(-MAX_STORED_MESSAGES));
-});
-
-const server = http.createServer(app);
-const io = new Server(server, {
-  cors: { origin: '*' },
-  path: '/socket.io'
-});
-
-
-function getClientIP(socket) {
-  const forwarded = socket.handshake.headers['x-forwarded-for'];
-  if (forwarded) return forwarded.split(',')[0].trim();
-  // fallback to socket address
-  return socket.handshake.address;
-}
-
-/* Socket handling */
+// Socket connection
 io.on('connection', (socket) => {
-  try {
-    const ip = getClientIP(socket);
-    ipConnections[ip] = (ipConnections[ip] || 0) + 1;
+  const userID = socket.handshake.auth?.userID;
+  if (!userID) return socket.disconnect();
 
-    if (ipConnections[ip] > MAX_CONNECTIONS_PER_IP) {
-      console.warn(`IP ${ip} exceeded max connections (${ipConnections[ip]}). Disconnecting.`);
-      socket.emit('error', { message: 'Too many connections from your IP' });
-      socket.disconnect(true);
-      ipConnections[ip]--;
+  const ip = getClientIP(socket);
+
+  // Permanent ban check
+  if (ipBans[ip]) {
+    socket.emit('warning', { message: 'Your IP is permanently banned.' });
+    return socket.disconnect(true);
+  }
+
+  ipConnections[ip] = (ipConnections[ip] || 0) + 1;
+  if (ipConnections[ip] > MAX_CONNECTIONS_PER_IP) {
+    socket.emit('error', { message: 'Too many connections from your IP' });
+    socket.disconnect(true);
+    ipConnections[ip]--;
+    return;
+  }
+
+  // Online users
+  if (!onlineUsers[userID]) onlineUsers[userID] = new Set();
+  onlineUsers[userID].add(socket.id);
+  io.emit('online_users', Object.keys(onlineUsers));
+
+  // Rate limit & spam
+  rateLimitState[socket.id] = { count: 0, windowStart: Date.now() };
+  lastMessageText[socket.id] = '';
+
+  // PRIVATE MESSAGE
+  socket.on("private_message", ({ to, from, text, time }) => {
+    text = sanitizeText(text);
+    if (!to || !text || text.length > MAX_MESSAGE_LENGTH) return;
+    if (isBase64Image(text) && text.length > MAX_IMAGE_SIZE_BASE64) return;
+
+    if (text === lastMessageText[socket.id]) {
+      ipSpamCount[ip] = (ipSpamCount[ip] || 0) + 1;
+      if (ipSpamCount[ip] >= 3) {
+        ipBans[ip] = 'permanent';
+        saveBanList();
+
+        const trollMessage = trollMessages[Math.floor(Math.random() * trollMessages.length)];
+        socket.emit('warning', { message: trollMessage });
+        return socket.disconnect(true);
+      }
+    } else {
+      ipSpamCount[ip] = 0;
+    }
+    lastMessageText[socket.id] = text;
+
+    (onlineUsers[to] || []).forEach(sid =>
+      io.to(sid).emit("receive_private", { from, text, time })
+    );
+  });
+
+  // LIVE CHAT MESSAGE
+  socket.on("live_message", (msg) => {
+    const now = Date.now();
+    let rl = rateLimitState[socket.id];
+    if (now - rl.windowStart > RATE_LIMIT_WINDOW_MS) {
+      rl.windowStart = now;
+      rl.count = 0;
+    }
+    rl.count++;
+    rateLimitState[socket.id] = rl;
+
+    if (rl.count > RATE_LIMIT_MAX_MESSAGES) {
+      if (rl.count === RATE_LIMIT_MAX_MESSAGES + 1) {
+        socket.emit('warning', { message: 'You are sending messages too fast. Slow down.' });
+      }
       return;
     }
 
-    // assign server-generated userID (client cannot choose)
-    const userID = generateUserID();
-    socket.userID = userID;
-    socketToUser[socket.id] = userID;
+    msg.text = sanitizeText(msg.text);
+    if (!msg.text || msg.text.length > MAX_MESSAGE_LENGTH) return;
+    if (isBase64Image(msg.text) && msg.text.length > MAX_IMAGE_SIZE_BASE64) return;
 
-    // store in onlineUsers
-    if (!onlineUsers[userID]) onlineUsers[userID] = [];
-    onlineUsers[userID].push(socket.id);
+    if (msg.text === lastMessageText[socket.id]) {
+      ipSpamCount[ip] = (ipSpamCount[ip] || 0) + 1;
+      if (ipSpamCount[ip] >= 3) {
+        ipBans[ip] = 'permanent';
+        saveBanList();
 
-    // init rate-limit state
-    rateLimitState[socket.id] = { count: 0, windowStart: Date.now() };
+        const trollMessage = trollMessages[Math.floor(Math.random() * trollMessages.length)];
+        socket.emit('warning', { message: trollMessage });
+        return socket.disconnect(true);
+      }
+    } else {
+      ipSpamCount[ip] = 0;
+    }
+    lastMessageText[socket.id] = msg.text;
 
-    // send welcome with assigned userID (client should accept this)
-    socket.emit('welcome', { userID });
+    liveChatMessages.push(msg);
+    if (liveChatMessages.length > 200) liveChatMessages.shift();
+    saveMessages();
+    io.emit("live_message", msg);
+  });
 
-    // broadcast current online users list
+  // Disconnect
+  socket.on("disconnect", () => {
+    if (onlineUsers[userID]) {
+      onlineUsers[userID].delete(socket.id);
+      if (!onlineUsers[userID].size) delete onlineUsers[userID];
+    }
     io.emit('online_users', Object.keys(onlineUsers));
 
-    /* PRIVATE MESSAGE HANDLER */
-    socket.on('private_message', (payload) => {
-      try {
-        // enforce structure & sanitize
-        const to = String(payload?.to || '').trim();
-        let text = sanitizeText(payload?.text || '');
-        const time = payload?.time || new Date().toLocaleTimeString();
-
-        // basic validation
-        if (!to || !text) return;
-        if (text.length > MAX_MESSAGE_LENGTH) return; // drop too long messages
-
-        // prevent inline base64 image spam in private messages (optional: allow via upload endpoint)
-        if (isBase64Image(text) && text.length > MAX_IMAGE_SIZE_BASE64) return;
-
-        // force 'from' to server-assigned userid (prevent spoof)
-        const from = socket.userID;
-
-        // deliver to all sockets of recipient
-        const destSockets = onlineUsers[to] || [];
-        destSockets.forEach(sid => {
-          io.to(sid).emit('receive_private', { from, text, time });
-        });
-
-        // optionally send ack to sender
-        socket.emit('private_sent', { to, text, time });
-      } catch (err) {
-        console.error('private_message error', err);
-      }
-    });
-
-    /* LIVE MESSAGE HANDLER */
-    socket.on('live_message', (payload) => {
-      try {
-        // rate limit check
-        const now = Date.now();
-        const rl = rateLimitState[socket.id] || { count: 0, windowStart: now };
-        if (now - rl.windowStart > RATE_LIMIT_WINDOW_MS) {
-          rl.windowStart = now;
-          rl.count = 0;
-        }
-        rl.count++;
-        rateLimitState[socket.id] = rl;
-        if (rl.count > RATE_LIMIT_MAX_MESSAGES) {
-          // silently drop excess messages or notify
-          if (rl.count === RATE_LIMIT_MAX_MESSAGES + 1) {
-            socket.emit('warning', { message: 'You are sending messages too fast. Slow down.' });
-          }
-          return;
-        }
-
-        // validate payload
-        let text = sanitizeText(payload?.text || '');
-        if (!text) return;
-        if (text.length > MAX_MESSAGE_LENGTH) return;
-
-        // block huge base64 strings (disallow inline large images)
-        if (isBase64Image(text)) {
-          if (text.length > MAX_IMAGE_SIZE_BASE64) return;
-          // optionally: reject inline images entirely:
-          // return;
-        }
-
-        // force authoritative userID for message origin
-        const msg = {
-          userID: socket.userID,
-          text,
-          time: new Date().toLocaleTimeString()
-        };
-
-        // append & persist (cap size)
-        liveChatMessages.push(msg);
-        if (liveChatMessages.length > MAX_STORED_MESSAGES) liveChatMessages.shift();
-        saveMessages();
-
-        // broadcast
-        io.emit('live_message', msg);
-      } catch (err) {
-        console.error('live_message error', err);
-      }
-    });
-
-    
-
-    /* disconnect handling */
-    socket.on('disconnect', () => {
-      // remove socket.id from onlineUsers mapping
-      const sid = socket.id;
-      const uid = socketToUser[sid];
-
-      if (uid && onlineUsers[uid]) {
-        onlineUsers[uid] = onlineUsers[uid].filter(x => x !== sid);
-        if (onlineUsers[uid].length === 0) delete onlineUsers[uid];
-      }
-
-      delete socketToUser[sid];
-      delete rateLimitState[sid];
-
-      // reduce ipConnections
-      if (ip && ipConnections[ip]) {
-        ipConnections[ip]--;
-        if (ipConnections[ip] <= 0) delete ipConnections[ip];
-      }
-
-      // broadcast updated online users
-      io.emit('online_users', Object.keys(onlineUsers));
-    });
-
-    /* protect: catch-all error handler for this socket */
-    socket.on('error', (err) => {
-      console.warn('socket error', err);
-    });
-  } catch (err) {
-    console.error('connection handler error', err);
-    try { socket.disconnect(true); } catch(e) {}
-  }
+    if (ip && ipConnections[ip]) {
+      ipConnections[ip]--;
+      if (ipConnections[ip] <= 0) delete ipConnections[ip];
+    }
+    delete rateLimitState[socket.id];
+    delete lastMessageText[socket.id];
+  });
 });
 
-app.get('/', (_, res) => res.send('Secure chat server running'));
+// Health check
+app.get("/", (_, res) => res.send("Server OK"));
 
-server.listen(PORT, () => console.log(`Secure chat server listening on ${PORT}`));
+const PORT = process.env.PORT || 4000;
+server.listen(PORT, () => console.log("Server running on " + PORT));
