@@ -1,3 +1,4 @@
+// server.js (NO CALL FEATURE VERSION)
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
@@ -41,14 +42,20 @@ try {
   } else fs.writeFileSync(BAN_LIST_FILE, "{}");
 } catch (err) { console.error("Error loading ban list:", err); }
 
-function saveMessages() { try { fs.writeFileSync(LIVE_CHAT_FILE, JSON.stringify(liveChatMessages, null, 2)); } catch (err) { console.error(err); } }
-function saveBanList() { try { fs.writeFileSync(BAN_LIST_FILE, JSON.stringify(ipBans, null, 2)); } catch (err) { console.error(err); } }
+function saveMessages() {
+  try { fs.writeFileSync(LIVE_CHAT_FILE, JSON.stringify(liveChatMessages, null, 2)); }
+  catch (err) { console.error(err); }
+}
 
-// Online users - NOW TRACKS BY SOCKET ID WITH SERVER-ASSIGNED USERNAMES
-const onlineUsers = {}; // { socketID: { userID, username, ip } }
-const ipToUserIDs = {}; // { ip: [userIDs] } - track all userIDs per IP
+function saveBanList() {
+  try { fs.writeFileSync(BAN_LIST_FILE, JSON.stringify(ipBans, null, 2)); }
+  catch (err) { console.error(err); }
+}
 
-// Anti-abuse
+// Online users
+const onlineUsers = {};
+const ipToUserIDs = {};
+
 const MAX_CONNECTIONS_PER_IP = 2;
 const ipConnections = {};
 const RATE_LIMIT_WINDOW_MS = 5000;
@@ -85,17 +92,16 @@ const trollMessages = [
   "🎉 Congratulations Dumbass You've spammed your way into a permanent ban. ! 👋",
 ];
 
-// Socket connection
 io.on('connection', (socket) => {
   const ip = getClientIP(socket);
-  
+
   // Check if IP is banned
   if (ipBans[ip]) { 
     socket.emit('warning', { message: 'Your IP is permanently banned.' }); 
     return socket.disconnect(true); 
   }
 
-  // Check connection limit per IP
+  // Limit connections per IP
   ipConnections[ip] = (ipConnections[ip] || 0) + 1;
   if (ipConnections[ip] > MAX_CONNECTIONS_PER_IP) {
     socket.emit('error', { message: 'Too many connections from your IP' });
@@ -104,21 +110,17 @@ io.on('connection', (socket) => {
     return;
   }
 
-  // SERVER ASSIGNS USERNAME - CLIENT CANNOT CONTROL THIS
+  // SERVER assigns username
   const userID = nanoid(10);
   const username = generateRandomName();
-  
-  // Store user info by socket ID
+
   onlineUsers[socket.id] = { userID, username, ip };
-  
-  // Track userIDs per IP
+
   if (!ipToUserIDs[ip]) ipToUserIDs[ip] = [];
   ipToUserIDs[ip].push(userID);
 
-  // Send the assigned username back to the client
   socket.emit('username_assigned', { username, userID });
 
-  // Broadcast updated online users list
   const usersList = Object.values(onlineUsers).map(u => u.username);
   io.emit('online_users', usersList);
 
@@ -140,20 +142,21 @@ io.on('connection', (socket) => {
       if (ipSpamCount[ip] >= 3) {
         ipBans[ip] = 'permanent';
         saveBanList();
-        const trollMessage = trollMessages[Math.floor(Math.random() * trollMessages.length)];
-        socket.emit('warning', { message: trollMessage });
+        const msg = trollMessages[Math.floor(Math.random() * trollMessages.length)];
+        socket.emit('warning', { message: msg });
         return socket.disconnect(true);
       }
     } else ipSpamCount[ip] = 0;
+
     lastMessageText[socket.id] = text;
 
     const message = { from: sender.username, text, time };
 
-    // Find recipient by username and send to them
-    const recipientSocket = Object.entries(onlineUsers).find(([sid, u]) => u.username === toName);
+    const recipientSocket = Object.entries(onlineUsers)
+      .find(([_, u]) => u.username === toName);
+
     if (recipientSocket) {
       io.to(recipientSocket[0]).emit("receive_private", message);
-      // Also send back to sender so they see their own message
       socket.emit("receive_private", message);
     }
   });
@@ -165,16 +168,16 @@ io.on('connection', (socket) => {
 
     const now = Date.now();
     let rl = rateLimitState[socket.id];
-    if (now - rl.windowStart > RATE_LIMIT_WINDOW_MS) { 
-      rl.windowStart = now; 
-      rl.count = 0; 
+
+    if (now - rl.windowStart > RATE_LIMIT_WINDOW_MS) {
+      rl.windowStart = now;
+      rl.count = 0;
     }
+
     rl.count++;
-    rateLimitState[socket.id] = rl;
-    
     if (rl.count > RATE_LIMIT_MAX_MESSAGES) {
       if (rl.count === RATE_LIMIT_MAX_MESSAGES + 1) {
-        socket.emit('warning', { message: 'You are sending messages too fast. Slow down.' });
+        socket.emit('warning', { message: 'You are sending messages too fast.' });
       }
       return;
     }
@@ -183,107 +186,51 @@ io.on('connection', (socket) => {
     if (!msg.text || msg.text.length > MAX_MESSAGE_LENGTH) return;
     if (isBase64Image(msg.text) && msg.text.length > MAX_IMAGE_SIZE_BASE64) return;
 
-    // Spam detection
     if (msg.text === lastMessageText[socket.id]) {
       ipSpamCount[ip] = (ipSpamCount[ip] || 0) + 1;
       if (ipSpamCount[ip] >= 3) {
         ipBans[ip] = 'permanent';
         saveBanList();
-        const trollMessage = trollMessages[Math.floor(Math.random() * trollMessages.length)];
-        socket.emit('warning', { message: trollMessage });
+        const msg = trollMessages[Math.floor(Math.random() * trollMessages.length)];
+        socket.emit('warning', { message: msg });
         return socket.disconnect(true);
       }
     } else ipSpamCount[ip] = 0;
+
     lastMessageText[socket.id] = msg.text;
 
-    // Use server-side username, not client-provided
-    const message = { 
-      userID: sender.username, 
-      text: msg.text, 
-      time: msg.time 
+    const message = {
+      userID: sender.username,
+      text: msg.text,
+      time: msg.time,
     };
-    
+
     liveChatMessages.push(message);
     if (liveChatMessages.length > 200) liveChatMessages.shift();
     saveMessages();
+
     io.emit("live_message", message);
   });
 
-  // CALL SIGNALING
-  socket.on("call-user", ({ to, offer, isVideo }) => {
-    const sender = onlineUsers[socket.id];
-    if (!sender) return;
-
-    // Find recipient by username
-    const recipientSocket = Object.entries(onlineUsers).find(([sid, u]) => u.username === to);
-    if (recipientSocket) {
-      io.to(recipientSocket[0]).emit("incoming-call", {
-        from: sender.username,
-        offer: offer,
-        isVideo: isVideo
-      });
-    }
-  });
-
-  socket.on("answer-call", ({ to, answer }) => {
-    const sender = onlineUsers[socket.id];
-    if (!sender) return;
-
-    // Find recipient by username
-    const recipientSocket = Object.entries(onlineUsers).find(([sid, u]) => u.username === to);
-    if (recipientSocket) {
-      io.to(recipientSocket[0]).emit("call-answered", {
-        answer: answer
-      });
-    }
-  });
-
-  socket.on("ice-candidate", ({ to, candidate }) => {
-    // Find recipient by username
-    const recipientSocket = Object.entries(onlineUsers).find(([sid, u]) => u.username === to);
-    if (recipientSocket) {
-      io.to(recipientSocket[0]).emit("ice-candidate", {
-        candidate: candidate
-      });
-    }
-  });
-
-  socket.on("end-call", ({ to }) => {
-    // Find recipient by username
-    const recipientSocket = Object.entries(onlineUsers).find(([sid, u]) => u.username === to);
-    if (recipientSocket) {
-      io.to(recipientSocket[0]).emit("call-ended");
-    }
-  });
-
-  socket.on("reject-call", ({ to }) => {
-    // Find recipient by username
-    const recipientSocket = Object.entries(onlineUsers).find(([sid, u]) => u.username === to);
-    if (recipientSocket) {
-      io.to(recipientSocket[0]).emit("call-rejected");
-    }
-  });
-
-  // Disconnect
+  // DISCONNECT CLEANUP
   socket.on("disconnect", () => {
     const user = onlineUsers[socket.id];
     if (user) {
-      // Remove from IP tracking
       if (ipToUserIDs[ip]) {
         ipToUserIDs[ip] = ipToUserIDs[ip].filter(id => id !== user.userID);
         if (ipToUserIDs[ip].length === 0) delete ipToUserIDs[ip];
       }
-      
       delete onlineUsers[socket.id];
     }
-    
+
     const usersList = Object.values(onlineUsers).map(u => u.username);
     io.emit('online_users', usersList);
 
-    if (ip && ipConnections[ip]) { 
-      ipConnections[ip]--; 
-      if (ipConnections[ip] <= 0) delete ipConnections[ip]; 
+    if (ipConnections[ip]) {
+      ipConnections[ip]--;
+      if (ipConnections[ip] <= 0) delete ipConnections[ip];
     }
+
     delete rateLimitState[socket.id];
     delete lastMessageText[socket.id];
   });
