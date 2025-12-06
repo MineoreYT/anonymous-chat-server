@@ -209,6 +209,61 @@ io.on('connection', (socket) => {
     io.emit("live_message", message);
   });
 
+  // CALL SIGNALING
+  socket.on("call-user", ({ to, offer, isVideo }) => {
+    const sender = onlineUsers[socket.id];
+    if (!sender) return;
+
+    // Find recipient by username
+    const recipientSocket = Object.entries(onlineUsers).find(([sid, u]) => u.username === to);
+    if (recipientSocket) {
+      io.to(recipientSocket[0]).emit("incoming-call", {
+        from: sender.username,
+        offer: offer,
+        isVideo: isVideo
+      });
+    }
+  });
+
+  socket.on("answer-call", ({ to, answer }) => {
+    const sender = onlineUsers[socket.id];
+    if (!sender) return;
+
+    // Find recipient by username
+    const recipientSocket = Object.entries(onlineUsers).find(([sid, u]) => u.username === to);
+    if (recipientSocket) {
+      io.to(recipientSocket[0]).emit("call-answered", {
+        answer: answer
+      });
+    }
+  });
+
+  socket.on("ice-candidate", ({ to, candidate }) => {
+    // Find recipient by username
+    const recipientSocket = Object.entries(onlineUsers).find(([sid, u]) => u.username === to);
+    if (recipientSocket) {
+      io.to(recipientSocket[0]).emit("ice-candidate", {
+        candidate: candidate
+      });
+    }
+  });
+
+  socket.on("end-call", ({ to }) => {
+    // Find recipient by username
+    const recipientSocket = Object.entries(onlineUsers).find(([sid, u]) => u.username === to);
+    if (recipientSocket) {
+      io.to(recipientSocket[0]).emit("call-ended");
+    }
+  });
+
+  socket.on("reject-call", ({ to }) => {
+    // Find recipient by username
+    const recipientSocket = Object.entries(onlineUsers).find(([sid, u]) => u.username === to);
+    if (recipientSocket) {
+      io.to(recipientSocket[0]).emit("call-rejected");
+    }
+  });
+
   // Disconnect
   socket.on("disconnect", () => {
     const user = onlineUsers[socket.id];
